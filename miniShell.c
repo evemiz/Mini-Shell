@@ -5,7 +5,9 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdbool.h>
 
+#define PATH_MAX 1024
 
 pid_t lastPid=-1;
 pid_t pidLastStop=-1;
@@ -24,549 +26,587 @@ struct node{
 };
 
 //functions
-void insertToLinkedLIst(struct node **head, vars newData);
-char* dollar(struct node* head, char* temp, int listSize, char** argv, int argc);
-void freeArgv(char** argv, const int* shouldFree);
-struct node* findNode (struct node *head, char* valueName);
 void freeList(struct node *head);
-int findCharFirstInd(char* command, char c);
-int findCharFromInd(char* command, char c, int i);
+void insertToLinkedList(struct node **head, vars newData);
+struct node* findNode(struct node* head, const char* valueName);
+int findFirstOccurrenceIndex(char *str, char targetChar);
+int findFirstOccurrenceIndexFrom(char *str, char targetChar, int startIndex);
+char *getVariableValue(struct node *head, const char *variableName, int listSize, char **argv, int argc);
+void freeArguments(char** argv, const int* shouldFree);
 void sig_child(int sig);
 void sig_stop(int sig);
 
+    int main() {
 
+        //Variables
+        struct node *head = NULL;
 
-int main() {
+        char currentCommandToExecute[511];
+        char savedCommands[510];
+        char savedCommandsFromPipe[510];
+        char saveFileName[510];
 
-    int numCommand = 0;         //valid commands counter
-    int numArgs = 0;            //arguments counter
-    char command[511];          //the string from the user
-    char save[510];             //array that keep the next command (if there is ;)
-    char saveFileName[510];     //array to save the name of a file
-    char savePipe[510];         //array to save the name of a file
-    int enterCounter=0;         //how many enters from the users
-    int moreCommand =1;         //if equal 0 - there is another command
-    int moreCommandPipe=1;      //if equal 0 - there is another pipe's command
-    int howManyComm =1;         //if equal 0 - need to add command to the numCommand
-    int varNotFound=1;          //if equal 0 - the var not exist
-    int invalidInput=1;         //if equal 0 - there are more than 10 arguments
-    int firstCharIsDollar=1;    //if equal 0 - the first char in the command string is $
-    int intoAFile=1;            //if equal 0 - the output should get into a file
-    struct node *head = NULL;   //linked list that will store the variables
-    int listSize=0;             //how many variables are in the linked list
-    int background=1;           //if equal 0 - the current command should run on background
-    int left=1;                 //if equal 0 - this is the left command in the pipe
-    int mid=1;                  //if equal 0 - this is the middle command in the pipe
-    int right=1;                //if equal 0 - this is the right command in the pipe
-    int shouldFree[11];         //array to store all the indexes in argv that should free after the exec
-    int shouldFreeCounter=0;    //how many pointers should be free
-    int** pipe_fd;              //two-dimensions array of pipes
-    int numberOfPipes=0;        //the number of pipes in the array
-    int curPipe=-1;             // the current pipe iteration
+        bool hasMoreCommandsAfterPipe = false;
+        bool hasMoreCommands = false;
+        bool isLeftmostCommand = false;
+        bool isMiddleCommand = false;
+        bool isRightmostCommand = false;
+        bool runInBackground = false;
+        bool isOutputRedirected = false;
 
-    signal(SIGTSTP, sig_stop);
-    signal(SIGCHLD, sig_child);
+        int **pipe_fd;
+        int commandCounter = 0;
+        int enterCounter = 0;
+        int numberOfPipes = 0;
+        int currentPipeNumber = -1;
+        int variableListSize = 0;
+        int flagsCounter = 0;
 
-    //the current path-----------------------------------------------------------------------------------------------------------
-    char currentPath[1024];
-    if ((getcwd(currentPath, sizeof(currentPath))) == NULL) {
-        printf("path error");
-        return 1;
-    }
+        signal(SIGTSTP, sig_stop);
+        signal(SIGCHLD, sig_child);
 
-//------------------------------------------------------------------------------------------------------------------------------
-    while (1) {
-        shouldFreeCounter=0;
-        background=1;
-        signal(SIGCONT, SIG_IGN);
-
-        //in case there is another command to execute (the input include ;)--------------------------------------------------------------------
-        if ( moreCommandPipe==0 || moreCommand == 0) {
-            int saveINd = 0;
-            if(right==0){
-                for (; saveINd < strlen(savePipe); saveINd++)
-                    command[saveINd] = savePipe[saveINd];
-                savePipe[0]='\0';
-                mid=1;
-            }
-            else{
-                for (; saveINd < strlen(save); saveINd++)
-                    command[saveINd] = save[saveINd];       //the array "save" will be the rest of the command - after the first ;
-                moreCommand=1;
-            }
-            command[saveINd] = '\0';
+        // Get the current working directory
+        char currentPath[PATH_MAX];
+        if ((getcwd(currentPath, sizeof(currentPath))) == NULL) {
+            perror("getcwd");
+            return 1;
         }
 
-            //in case of input from user--------------------------------------------------------------------------------------------------------
-        else {
-            printf("\033[35m#cmd:%d|#args:%d@%s\033[0m ", numCommand, numArgs, currentPath);
-            fgets(command, sizeof(command), stdin);
-        }
+        //Main loop to keep the program running continuously
+        while (1) {
 
-        //-----------------------------------------------------------------------------------------------------------------------------------
-
-        int len = (int)strlen(command);
-
-        if(command[len-1]=='\n')
-            command[len-1]='\0';
-        char *argv[11]; //the arguments array
-        for (int i = 0; i < 11; ++i) {
-            argv[i]=NULL;
-            shouldFree[i]=-1;
-        }
-
-
-        //in case the input is 'enter'-------------------------------------------------------------------------------------------------------
-        if (command[0] == 0) {
-            if (enterCounter == 2) {        //if the user click on the enter 3 times in a row - exit
-                freeList(head);
-                exit(0);
-            }
-            enterCounter++;
-            continue;
-        }
-        enterCounter = 0;
-
-        //check if there are more commands ---------------------------------------------------------------------------------------------
-
-        int ind2= findCharFirstInd(command, ';');
-        int i1= findCharFirstInd(command,'"');
-        int i2;
-        if(i1==-1)
-            i2=-1;
-        else
-            i2= findCharFromInd(command,'"',i1+1);
-        while(ind2!=-1){
-            if(!(i1<ind2 && ind2<i2)){
-                int j = ind2+1;
-                for ( int i=0 ; j <= strlen((command)); ++i) {
-                    save[i] = command[j++];
-                }
-                moreCommand = 0;
-                howManyComm=0;
-                command[ind2]='\0';
-                break;
-            }
-            ind2= findCharFromInd(command,';',ind2+1);
-        }
-
-        int ind5 = findCharFirstInd(command, '&');
-        if(ind5!=-1){
-            background=0;
-            command[ind5]='\0';
-        }
-
-        //if the output should insert into a file
-        int ind4= findCharFirstInd(command,'>');
-        if(ind4!=-1){
-            int j = ind4+1;
-            while (j <= strlen((command))) {
-                if(command[j]!=' ')
-                    break;
-                j++;
-            }
-            for ( int i=0 ; j <= strlen((command)); ++i) {
-                saveFileName[i] = command[j++];
-                if (command[j]==' ')
-                    break;
-            }
-            command[ind4]='\0';
-            intoAFile=0;
-        }
-
-        //if there is a pipe
-        int ind6= findCharFirstInd(command,'|');
-        int sent1= findCharFirstInd(command,'"');
-        int sent2=-1;
-        if (sent1!=-1)
-            sent2= findCharFromInd(command,'"',sent1+1);
-        if ((sent1<ind6 && sent2>ind6)){
-            ind6= findCharFromInd(command,'|',sent2+1);
-        }
-        if(ind6 !=-1){
-            if (numberOfPipes==0){
-                for (int i = ind6; i < strlen(command); ++i) {
-                    if (command[i]=='|')
-                        numberOfPipes++;
-                }
-                pipe_fd= malloc(numberOfPipes*sizeof(int*));
-                for (int i = 0; i < numberOfPipes; ++i) {
-                    pipe_fd[i]= malloc(2* sizeof(int));
-                }
-                mid=1;
-            }
-            else
-                mid=0;
-
-            curPipe++;
-            left=0;
-            right=1;
-            int j = ind6+1;
-            for ( int i=0 ; j <= strlen((command)); ++i) {
-                savePipe[i] = command[j++];
-            }
-            moreCommandPipe = 0;
-            command[ind6]='\0';
-        }
-
-        int ind1= findCharFirstInd(command,'=');
-        //there is a variable assignment - add new struct to the array-------------------------------------------------------------------------
-        if (ind1!=-1) {
-
-            //Assigning a name to the variable
-            char *temp1 = strtok(command, "=");
-            vars var;
-            int ind=0;
-            for(int i =0; temp1[i]!='\0'; i++){
-                if(temp1[i]!=' ') {
-                    var.name[ind] = temp1[i];
-                    ind++;
+            // Check if there are more commands to process
+            if (hasMoreCommandsAfterPipe || hasMoreCommands) {
+                if (isRightmostCommand) {
+                    // Copy characters from savedCommandsFromPipe to currentCommandToExecute
+                    strncpy(currentCommandToExecute, savedCommandsFromPipe, sizeof(currentCommandToExecute) - 1);
+                    currentCommandToExecute[sizeof(currentCommandToExecute) - 1] = '\0';
+                    savedCommandsFromPipe[0] = '\0';
+                    isMiddleCommand = false;
+                } else {
+                    // Copy characters from savedCommands to currentCommandToExecute
+                    strncpy(currentCommandToExecute, savedCommands, sizeof(currentCommandToExecute) - 1);
+                    currentCommandToExecute[sizeof(currentCommandToExecute) - 1] = '\0';
+                    hasMoreCommands = false;
                 }
             }
-            var.name[ind]='\0';
-
-            //Assigning a value to the variable
-            temp1 = strtok(NULL, " ");
-            ind=0;
-            for(int i =0; temp1[i]!='\0'; i++){
-                var.value[ind] = temp1[i];
-                ind++;
+                // Input from the user
+            else {
+                printf("\033[35m#cmd:%s\033[0m ",currentPath);
+                fgets(currentCommandToExecute, sizeof(currentCommandToExecute), stdin);
             }
-            var.value[ind]='\0';
 
-            temp1 = strtok(NULL, "\0");
-            if(temp1!=NULL){
-                printf("%s: command not found\n",temp1);
+            // Initializing
+            int commandLength = (int) strlen(currentCommandToExecute);
+            if (currentCommandToExecute[commandLength - 1] == '\n') {
+                currentCommandToExecute[commandLength - 1] = '\0';
+            }
+            char *arguments[11] = {NULL};  // The arguments array
+            int memoryCleanupFlags[11] = {-1}; // Array to track whether to free memory for each argument
+
+            // Handle consecutive 'enter' key presses: if entered three times in a row, exit; otherwise, reset counter
+            if (currentCommandToExecute[0] == '\0') {
+                if (enterCounter == 2) {
+                    freeList(head);
+                    exit(0);
+                }
+                enterCounter++;
                 continue;
             }
+            enterCounter = 0;
 
-            //insert the new var into the array
-            listSize++;
-            insertToLinkedLIst(&head, var);
-        }
-
-            //the input is a command that need to exec ----------------------------------------------------------------------------------------
-
-        else {
-            char *rest;
-            char *temp = strtok_r(command, " ", &rest);
-            int argc = 0;
-
-            if (findCharFirstInd(temp, '$') != 0) {
-                argv[0] = temp;
-                argc = 1;  //arguments of the current command counter
-            } else
-                firstCharIsDollar = 0;
-
-
-            while (temp != NULL) {
-
-//if the input is not legal - there are more than 10 arguments------------------------------------------------------------
-                if (argc > 10 && argv[10] != NULL) {
-                    invalidInput = 0;
+            // Check for multiple commands separated by semicolons
+            int semicolonIndex = findFirstOccurrenceIndex(currentCommandToExecute, ';');
+            int quoteStartIndex = findFirstOccurrenceIndex(currentCommandToExecute, '"');
+            int quoteEndIndex = (quoteStartIndex == -1) ? -1 : findFirstOccurrenceIndexFrom(currentCommandToExecute,
+                                                                                            '"', quoteStartIndex + 1);
+            while (semicolonIndex != -1) {
+                // Ensure the semicolon is not within a pair of double quotes
+                if (!(quoteStartIndex < semicolonIndex && semicolonIndex < quoteEndIndex)) {
+                    int copyIndex = semicolonIndex + 1;
+                    // Copy the remaining part of the command after the semicolon to 'save'
+                    for (int i = 0; copyIndex <= strlen(currentCommandToExecute); ++i) {
+                        savedCommands[i] = currentCommandToExecute[copyIndex++];
+                    }
+                    hasMoreCommands = true;
+                    //howManyComm = 0;
+                    currentCommandToExecute[semicolonIndex] = '\0';
                     break;
                 }
-
-
-//if this is a variable--------------------------------------------------------------------------------------------------------------
-                if (rest[0] == '$' || firstCharIsDollar==0) {
-                    int charIndex= findCharFirstInd(rest,'"');
-                    if(rest[0]=='$' && firstCharIsDollar!=0){
-                        if (charIndex!=-1){
-                            temp = strtok_r(NULL, "\"", &rest);
-                        }
-                        else
-                            temp = strtok_r(NULL, " ", &rest);
-                    }
-                    temp[charIndex]='\0';
-                    firstCharIsDollar=1;
-                    int charInd= findCharFirstInd(temp,';');
-                    if(charInd!=-1)
-                        temp[charInd]='\0';
-                    char* dollarI = dollar(head,temp+1,listSize,argv,argc);
-                    if(dollarI==NULL){
-                        varNotFound=0;
-                        break;
-                    }
-                    shouldFree[shouldFreeCounter]=argc;
-                    shouldFreeCounter++;
-                    if (charIndex!=-1){
-                        dollarI=(char*) realloc(dollarI,sizeof(dollarI)+sizeof(rest)+1);
-                        strcat(dollarI,rest);
-                        dollarI[findCharFirstInd(dollarI,'"')]='\0';
-                        temp = strtok_r(NULL, "\"", &rest);
-                        temp = strtok_r(NULL, " ", &rest);
-                    }
-                    argv[argc]=dollarI;
-                    argc++;
-
-                    if(charInd!=-1){
-                        break;
-                    }
-                }
-
-
-//if this is a sentence between ""------------------------------------------------------------------------------------------
-
-
-                else if (rest[0] == '"' && firstCharIsDollar == 1) {
-                    temp = strtok_r(NULL, "\"", &rest);
-                    int dollarInd = findCharFirstInd(temp, '$');
-                    if (dollarInd == -1)
-                        argv[argc] = temp;
-                    else {
-                        char *newTemp = strtok_r(temp, " ", &rest);
-                        char* dollarI = dollar(head, newTemp + 1, listSize, argv, argc);
-                        if (dollarI == NULL) {
-                            varNotFound = 0;
-                            break;
-                        }
-                        shouldFree[shouldFreeCounter]=argc;
-                        shouldFreeCounter++;
-                        argv[argc]=dollarI;
-                    }
-                    argc++;
-                }
-
-                else {
-                    temp = strtok_r(NULL, " ", &rest);
-                    argv[argc] = temp;
-                    argc++;
-                }
+                semicolonIndex = findFirstOccurrenceIndexFrom(currentCommandToExecute, ';', semicolonIndex + 1);
             }
 
-//if the input is a variable that doesn't exist-------------------------------------------------------------------------------
-            if(varNotFound==0){
-                varNotFound=1;
-                if(argv[0]==NULL){
+            // Check for background execution indicator '&' in the command
+            int backgroundIndicatorIndex = findFirstOccurrenceIndex(currentCommandToExecute, '&');
+            if (backgroundIndicatorIndex != -1) {
+                runInBackground = true;
+                currentCommandToExecute[backgroundIndicatorIndex] = '\0';
+            }
+
+            // Check if output should be redirected to a file
+            int outputRedirectIndex = findFirstOccurrenceIndex(currentCommandToExecute, '>');
+            if (outputRedirectIndex != -1) {
+                int fileNameStartIndex = outputRedirectIndex + 1;
+                // Skip whitespace characters after '>'
+                while (currentCommandToExecute[fileNameStartIndex] == ' ') {
+                    fileNameStartIndex++;
+                }
+                // Extract the filename after '>'
+                int i = 0;
+                while (currentCommandToExecute[fileNameStartIndex] != ' ' && currentCommandToExecute[fileNameStartIndex] != '\0') {
+                    saveFileName[i] = currentCommandToExecute[fileNameStartIndex++];
+                    i++;
+                }
+                saveFileName[i] = '\0';
+                currentCommandToExecute[outputRedirectIndex] = '\0';
+                isOutputRedirected = true;
+            }
+
+            // Check for the presence of a pipe '|'
+            int pipeIndex = findFirstOccurrenceIndex(currentCommandToExecute, '|');
+            quoteStartIndex = findFirstOccurrenceIndex(currentCommandToExecute, '"');
+            quoteEndIndex = (quoteStartIndex != -1) ? findFirstOccurrenceIndexFrom(currentCommandToExecute, '"',
+                                                                                   quoteStartIndex + 1) : -1;
+            // Adjust pipeIndex if it is within a pair of double quotes
+            if (quoteStartIndex < pipeIndex && pipeIndex < quoteEndIndex) {
+                pipeIndex = findFirstOccurrenceIndexFrom(currentCommandToExecute, '|', quoteEndIndex + 1);
+            }
+            if (pipeIndex != -1) {
+                if (numberOfPipes == 0) {
+                    // Count the total number of pipes in the command
+                    numberOfPipes = 0;
+                    for (int i = pipeIndex; i < strlen(currentCommandToExecute); ++i) {
+                        if (currentCommandToExecute[i] == '|') {
+                            numberOfPipes++;
+                        }
+                    }
+                    // Allocate memory for pipe file descriptors
+                    pipe_fd = malloc(numberOfPipes * sizeof(int *));
+                    for (int i = 0; i < numberOfPipes; ++i) {
+                        pipe_fd[i] = malloc(2 * sizeof(int));
+                    }
+                    isMiddleCommand = false;
+                } else {
+                    isMiddleCommand = true;
+                }
+                currentPipeNumber++;
+                isLeftmostCommand = true;
+                isRightmostCommand = false;
+                // Extract the command after the pipe '|'
+                int j = pipeIndex + 1;
+                for (int i = 0; j <= strlen(currentCommandToExecute); ++i) {
+                    savedCommandsFromPipe[i] = currentCommandToExecute[j++];
+                }
+                hasMoreCommandsAfterPipe = true;
+                currentCommandToExecute[pipeIndex] = '\0';
+            }
+
+            // Check for variable assignment
+            int equalSignIndex = findFirstOccurrenceIndex(currentCommandToExecute, '=');
+            if (equalSignIndex != -1) {
+                // Extract the name of the variable
+                char *variableName = strtok(currentCommandToExecute, "=");
+                vars newVariable;
+                int index = 0;
+                for (int i = 0; variableName[i] != '\0'; i++) {
+                    if (variableName[i] != ' ') {
+                        newVariable.name[index] = variableName[i];
+                        index++;
+                    }
+                }
+                newVariable.name[index] = '\0';
+                // Extract the value of the variable
+                char *variableValue = strtok(NULL, " ");
+                index = 0;
+                for (int i = 0; variableValue[i] != '\0'; i++) {
+                    newVariable.value[index] = variableValue[i];
+                    index++;
+                }
+                newVariable.value[index] = '\0';
+                char *extraToken = strtok(NULL, "\0");
+                if (extraToken != NULL) {
+                    printf("%s: command not found\n", extraToken);
                     continue;
                 }
-                argc++;
+                // Insert the new variable into the array
+                variableListSize++;
+                insertToLinkedList(&head, newVariable);
             }
 
-            int argvInd=0;
-            argc=0;
-            while (argv[argvInd]!=NULL){
-                argc++;
-                argvInd++;
-            }
-
-
-            //if there are more than 10 arguments--------------------------------------------------------------------------------------------
-            if(invalidInput==0){
-                freeArgv(argv,shouldFree);
-                printf("Invalid input\n");
-                invalidInput=1;
-                continue;
-            }
-
-
-            //if the input is cd- command that not supported----------------------------------------------------------------------------------
-            if (strcmp(argv[0], "cd") == 0) {
-                argv[0] = "echo";
-                argv[1] = "cd not supported";
-                argv[2] = NULL;
-                numCommand--;
-                argc=0;
-            }
-
-            if (strcmp(argv[0], "bg") == 0) {
-                if (pidLastStop!=-1){
-                    pidLastStop=-1;
-                    kill(pidLastStop,SIGCONT);
-                }
-                continue;
-            }
-
-//-------------------------------------------------------------------------------------------------------------------------------------------
-
-
-            if (curPipe==0 && left==0){
-                for (int i = 0; i < numberOfPipes; ++i) {
-                    if (pipe(pipe_fd[i])==-1){
-                        perror("pipe");
-                        exit(1);
-                    }
-                }
-            }
-
-            int status;
-            pid_t pid = fork();
-
-            if (background==0){
-                numCommand++;
-                numArgs += (argc+1);
-            }
+                // If it is not a variable assignment, treat it as a command to be executed
             else {
-                lastPid=pid;
-            }
-
-            //child process
-            if (pid == 0) {
-                if (mid==0){
-                    close(pipe_fd[curPipe-1][1]);
-                    dup2(pipe_fd[curPipe-1][0],STDIN_FILENO);
-                    close(pipe_fd[curPipe][0]);
-                    dup2(pipe_fd[curPipe][1],STDOUT_FILENO);
-                }
-                if(right==0){
-                    close(pipe_fd[curPipe][1]);
-                    dup2(pipe_fd[curPipe][0],STDIN_FILENO);
-                }
-                else if (left==0){
-                    close(pipe_fd[curPipe][0]);
-                    dup2(pipe_fd[curPipe][1],STDOUT_FILENO);
+                // Tokenize the command using space as delimiter
+                char *rest;
+                char *token = strtok_r(currentCommandToExecute, " ", &rest);
+                int argc = 0;
+                bool isFirstCharDollar = false;
+                // Check if the first token does not start with '$'
+                if (findFirstOccurrenceIndex(token, '$') != 0) {
+                    arguments[0] = token;
+                    argc = 1;  // Arguments for the current command counter
+                } else {
+                    isFirstCharDollar = true;
                 }
 
-                if(intoAFile==0 && (right==0 || numberOfPipes==0)){
-                    int fd_file = open(saveFileName,O_WRONLY|O_CREAT|O_TRUNC,S_IRWXU);
-                    if(fd_file==-1){
-                        perror("open");
+                bool invalidInput = false;
+                bool varNotFound = false;
+
+                while (token != NULL) {
+
+                    // Check if the input is not legal (more than 10 arguments)
+                    if (argc > 10 && arguments[10] != NULL) {
+                        invalidInput = true;
+                        break;
+                    }
+
+                    // Check if this is a variable
+                    if ((rest != NULL && rest[0] == '$') || isFirstCharDollar) {
+                        int charIndex = -1;
+                        if (!isFirstCharDollar)
+                            charIndex = findFirstOccurrenceIndex(rest, '"');
+                        // Handle cases where variable value is enclosed in double quotes
+                        if (!isFirstCharDollar && (rest != NULL && rest[0] == '$')) {
+                            if (charIndex != -1) {
+                                token = strtok_r(NULL, "\"", &rest);
+                                token[charIndex] = '\0';
+                            } else {
+                                token = strtok_r(NULL, " ", &rest);
+                            }
+                        }
+                        isFirstCharDollar = false;
+
+                        int charInd = findFirstOccurrenceIndex(token, ';');
+                        if (charInd != -1) {
+                            token[charInd] = '\0';
+                        }
+                        char *dollarResult = getVariableValue(head, token + 1, variableListSize, arguments, argc);
+
+                        if (dollarResult == NULL) {
+                            varNotFound = true;
+                            break;
+                        }
+
+                        memoryCleanupFlags[flagsCounter] = argc;
+                        flagsCounter++;
+
+                        // Handle cases where variable value is enclosed in double quotes
+                        if (charIndex != -1) {
+                             char* tempResult= (char *) realloc(dollarResult, strlen(dollarResult) + strlen(rest) + 1);
+                            if (tempResult != NULL) {
+                                dollarResult = tempResult;
+                            } else {
+                                printf("An error occurred.\n");
+                                exit(EXIT_FAILURE);
+                            }
+                            strcat(dollarResult, rest);
+                            dollarResult[findFirstOccurrenceIndex(dollarResult, '"')] = '\0';
+                            token = strtok_r(NULL, "\"", &rest);
+                            token = strtok_r(NULL, " ", &rest);
+                        }
+
+                        arguments[argc] = dollarResult;
+                        argc++;
+
+                        // Break if a semicolon is encountered
+                        if (charInd != -1) {
+                            break;
+                        }
+                    }
+
+                    // If this is a sentence between ""
+                    else if (rest != NULL && rest[0] == '"') {
+                        token = strtok_r(NULL, "\"", &rest);
+                        int dollarInd = findFirstOccurrenceIndex(token, '$');
+
+                        if (dollarInd == -1) {
+                            // No variable substitution needed, directly use the content between quotes
+                            arguments[argc] = token;
+                        } else {
+                            // Variable substitution needed
+                            char *newTemp = strtok_r(token, " ", &rest);
+                            char* dollarResult = getVariableValue(head, newTemp + 1, variableListSize, arguments, argc);
+
+                            if (dollarResult == NULL) {
+                                varNotFound = true;
+                                break;
+                            }
+
+                            memoryCleanupFlags[flagsCounter] = argc;
+                            flagsCounter++;
+                            arguments[argc] = dollarResult;
+                        }
+
+                        argc++;
+                    }
+
+                    else {
+                        token = strtok_r(NULL, " ", &rest);
+                        arguments[argc] = token;
+                        argc++;
+                    }
+                }
+
+                // If the input is a variable that doesn't exist
+                if (varNotFound) {
+                    varNotFound = false;
+                }
+
+                // Calculate the total number of arguments in argv
+                int argvInd = 0;
+                argc = 0;
+                while (arguments[argvInd] != NULL) {
+                    argc++;
+                    argvInd++;
+                }
+
+                // If there are more than 10 arguments
+                if (invalidInput) {
+                    // Free memory and print an error message
+                    freeArguments(arguments, memoryCleanupFlags);
+                    printf("Invalid input\n");
+                    invalidInput = false;
+                    continue;
+                }
+
+                // If the input is a 'cd' command, which is not supported
+                if (strcmp(arguments[0], "cd") == 0) {
+                    // Replace 'cd' with 'echo' and provide a message
+                    arguments[0] = "echo";
+                    arguments[1] = "cd not supported";
+                    arguments[2] = NULL;
+                    // Adjust counters to skip execution
+                    commandCounter--;
+                    argc = 0;
+                }
+
+                // If the input is a 'bg' command
+                if (strcmp(arguments[0], "bg") == 0) {
+                    // Check if there's a process in the background
+                    if (pidLastStop != -1) {
+                        // Resume the last stopped process
+                        pidLastStop = -1;
+                        kill(pidLastStop, SIGCONT);
+                    }
+                    // Skip further processing
+                    continue;
+                }
+
+                // Check if it is the first command in the pipeline and the leftmost part
+                if (currentPipeNumber == 0 && isLeftmostCommand) {
+                    // Create pipes for the entire pipeline
+                    for (int i = 0; i < numberOfPipes; ++i) {
+                        if (pipe_fd!=NULL && pipe(pipe_fd[i]) == -1) {
+                            perror("pipe");
+                            exit(1);
+                        }
+                    }
+                }
+
+                int status;
+                pid_t pid = fork();
+
+                // Increment counters for non-background commands
+                if (runInBackground) {
+                    commandCounter++;
+                }
+                else {
+                    lastPid = pid;
+                }
+
+                // Child process
+                if (pid == 0) {
+                    // Set up redirection for input/output based on pipeline position
+                    if (isMiddleCommand && pipe_fd!=NULL) {
+                        close(pipe_fd[currentPipeNumber - 1][1]);
+                        dup2(pipe_fd[currentPipeNumber - 1][0], STDIN_FILENO);
+                        close(pipe_fd[currentPipeNumber][0]);
+                        dup2(pipe_fd[currentPipeNumber][1], STDOUT_FILENO);
+                    }
+                    if (isRightmostCommand && pipe_fd!=NULL) {
+                        close(pipe_fd[currentPipeNumber][1]);
+                        dup2(pipe_fd[currentPipeNumber][0], STDIN_FILENO);
+                    } else if (isLeftmostCommand && pipe_fd!=NULL) {
+                        close(pipe_fd[currentPipeNumber][0]);
+                        dup2(pipe_fd[currentPipeNumber][1], STDOUT_FILENO);
+                    }
+
+                    // Redirect output to a file if needed
+                    if (isOutputRedirected && (isRightmostCommand || numberOfPipes == 0)) {
+                        int fd_file = open(saveFileName, O_WRONLY | O_CREAT | O_TRUNC, S_IRWXU);
+                        if (fd_file == -1) {
+                            perror("open");
+                            exit(1);
+                        }
+                        dup2(fd_file, STDOUT_FILENO);
+                    }
+
+                    // Execute the command
+                    if (strcmp(arguments[0], "bg") != 0) {
+                        execvp(arguments[0], arguments);
+                        perror("exec");
+                        dup2(STDOUT_FILENO, STDOUT_FILENO);
                         exit(1);
                     }
-                    dup2(fd_file,STDOUT_FILENO);
                 }
 
-
-                if(strcmp(argv[0],"bg")!=0){
-                    execvp(argv[0], argv);
-                    perror("exec");
-                    exit(1);
+                // Check if fork failed
+                if (pid < 0) {
+                    perror("fork");
+                    return 1;
                 }
-            }
 
-            //the fork didn't work
-            if (pid < 0) {
-                perror("fork");
-                return 1;
-            }
+                // Parent process
+                if (pid > 0 && !runInBackground && pid != pidLastStop) {
+                    // Wait for the child to finish
+                    waitpid(pid, &status, WUNTRACED);
 
-            //the father process
-            if(pid > 0 && background==1 && pid!=pidLastStop) {
-                waitpid(pid, &status, WUNTRACED);
-                if (mid == 0) {
-                    close(pipe_fd[curPipe - 1][0]);
-                    close(pipe_fd[curPipe][1]);
-                    left = 1;
-                    right = 0;
-                } else if (left == 0) {
-                    close(pipe_fd[curPipe][1]);
-                    left = 1;
-                    right = 0;
-                } else if (right == 0) {
-                    close(pipe_fd[curPipe][0]);
-                    right = 1;
-                    moreCommandPipe = 1;
-                    if (numberOfPipes == (curPipe + 1) ) {
-                        for (int i = 0; i < numberOfPipes; ++i) {
-                            free(pipe_fd[i]);
+                    // Handle pipeline and file redirection
+                    if (isMiddleCommand && pipe_fd!=NULL) {
+                        close(pipe_fd[currentPipeNumber - 1][0]);
+                        close(pipe_fd[currentPipeNumber][1]);
+                        isLeftmostCommand = false;
+                        isRightmostCommand = true;
+                    } else if (isLeftmostCommand && pipe_fd!=NULL) {
+                        close(pipe_fd[currentPipeNumber][1]);
+                        isLeftmostCommand = false;
+                        isRightmostCommand = true;
+                    } else if (isRightmostCommand && pipe_fd!=NULL) {
+                        close(pipe_fd[currentPipeNumber][0]);
+                        isRightmostCommand = false;
+                        hasMoreCommandsAfterPipe = false;
+
+                        // Free allocated memory for pipes
+                        if (numberOfPipes == (currentPipeNumber + 1)) {
+                            for (int i = 0; i < numberOfPipes; ++i) {
+                                free(pipe_fd[i]);
+                            }
+                            free(pipe_fd);
+                            pipe_fd = NULL;
                         }
-                        free(pipe_fd);
+                        currentPipeNumber = -1;
+                        numberOfPipes = 0;
                     }
-                    curPipe = -1;
-                    numberOfPipes = 0;
+
+                    if (isOutputRedirected && !isRightmostCommand && !isMiddleCommand) {
+                        isOutputRedirected = false;
+                        dup2(STDOUT_FILENO, STDOUT_FILENO);
+                    }
+
+                    // Handle exit status and update counters
+                    if (WIFEXITED(status)) {
+                        int exitStatus = WEXITSTATUS(status);
+
+                        if (exitStatus == 0) {
+                            if (hasMoreCommands )
+                                hasMoreCommands = false;
+                            commandCounter++;
+                        }
+                        freeArguments(arguments, memoryCleanupFlags);
+                    }
                 }
 
-                if (WIFEXITED(status)) {
-                    int exitStatus = WEXITSTATUS(status);
-                    if (intoAFile == 0 && left == 1 && right == 1 && mid == 1) {
-                        intoAFile = 1;
-                        dup2(STDOUT_FILENO, STDOUT_FILENO);
-                        argc += 2;
-                    }
-                    if (exitStatus == 0) {
-                        if (howManyComm == 0)
-                            howManyComm = 1;
-                        numCommand++;
-                        numArgs += argc;
-                    }
-                    freeArgv(argv, shouldFree);
-                }
             }
         }
     }
-}
 
-//---------------------------------------------------------------------------------------------------------------------------------------------
-//function to find the index of the first char apperance in string
-int findCharFirstInd(char* command, char c){
-    int toReturn=-1;
-    char *ptr1 = strchr(command, c);
-    if (ptr1 != NULL) {
-        toReturn = (int)(ptr1 - command);
+// Free the memory allocated for a linked list
+    void freeList(struct node *head) {
+        struct node *current = head;
+        struct node *next;
+        while (current != NULL) {
+            next = current->next;
+            free(current);
+            current = next;
+        }
     }
-    return toReturn;
-}
 
-int findCharFromInd(char* command, char c, int ind){
-    char afterChar[strlen(command)];
-    int j=0,i=ind;
-    while(i< strlen(command))
-        afterChar[j++]=command[i++];
-    afterChar[j]='\0';
-    int toReturn=findCharFirstInd(afterChar,c);
-    if (toReturn==-1)
-        return toReturn;
-    return toReturn+ind;
-}
+// Inserts a new node at the beginning of the linked list
+    void insertToLinkedList(struct node **head, vars newData) {
+        struct node *newNode = (struct node *) malloc(sizeof(struct node));
+        newNode->data = newData;
+        newNode->next = *head;
+        *head = newNode;
+    }
 
-//function that change the value of the variable in the argv array
-char* dollar(struct node* head, char* temp, int listSize, char** argv, int argc){
-    struct node *result = findNode(head, temp);
-    if (listSize == 0 || result==NULL)
-        return NULL;
-    char *temp3=(char*) malloc(sizeof(char)*(strlen(result->data.value) +1 ));
-    strcpy(temp3,result->data.value);
-    return temp3;
-}
+// Find and return the node with the specified value name in the linked list
+    struct node *findNode(struct node *head, const char *valueName) {
+        struct node *current = head;
 
-void freeArgv(char** argv, const int* shouldFree){
-    int i=0;
-    while (shouldFree[i]!=-1){
+        // Traverse the linked list
+        while (current != NULL) {
+            // Check if the current node's name matches the specified value name
+            if (strcmp(current->data.name, valueName) == 0) {
+                return current;  // Node found, return the pointer to it
+            }
+            current = current->next;
+        }
+        return NULL;  // Node not found
+    }
+
+// Find the first occurrence index of a character in a string
+    int findFirstOccurrenceIndex(char *str, char targetChar) {
+        char *charPtr = strchr(str, targetChar);
+        return (charPtr != NULL) ? (int) (charPtr - str) : -1;
+    }
+
+// Find the first occurrence index of a character in a string, starting from a given index
+    int findFirstOccurrenceIndexFrom(char *str, char targetChar, int startIndex) {
+        // Extract the substring starting from the given index
+        char substring[strlen(str) - startIndex + 1];
+        int j = 0, i = startIndex;
+        while (i < strlen(str))
+            substring[j++] = str[i++];
+        substring[j] = '\0';
+
+        // Find the index of the target character in the substring
+        int indexInSubstring = findFirstOccurrenceIndex(substring, targetChar);
+
+        // If the character is not found, return -1; otherwise, return the actual index in the original string
+        return (indexInSubstring == -1) ? -1 : indexInSubstring + startIndex;
+    }
+
+// Function to retrieve the value of a variable and update argv
+    char *getVariableValue(struct node *head, const char *variableName, int listSize, char **argv, int argc) {
+        struct node *result = findNode(head, variableName);
+
+        if (listSize == 0 || result == NULL) {
+            return NULL;
+        }
+
+        char *variableValue = (char *) malloc(sizeof(char) * (strlen(result->data.value) + 1));
+        strcpy(variableValue, result->data.value);
+
+        // Update argv if applicable
+        if (argc < 10) {
+            argv[argc] = variableValue;
+        }
+
+        return variableValue;
+    }
+
+// Frees the dynamically allocated memory for specific elements in arguments based on shouldFree array
+void freeArguments(char** argv, const int* shouldFree) {
+    int i = 0;
+    while (shouldFree[i] != -1) {
         free(argv[shouldFree[i]]);
         i++;
     }
 }
 
-
-
-//linked list functions-------------------------------------------------------------------------------------------------------------------------
-void insertToLinkedLIst(struct node **head, vars newData){
-    struct node *newNode = (struct node*) malloc(sizeof(struct node));
-    newNode->data = newData;
-    newNode->next=*head;
-    *head=newNode;
+// Signal handler for SIGCHLD
+void sig_child(int sig) {
+    // Reap terminated child processes
+    waitpid(-1, NULL, WNOHANG);
 }
 
-struct node* findNode (struct node *head, char* valueName){
-    struct node *current =head;
-    while (current!=NULL){
-        if(strcmp(current->data.name, valueName)==0){
-            return current;
-        }
-        current=current->next;
-    }
-    return NULL;
-}
-
-void freeList(struct node *head){
-    struct node *current = head;
-    struct node *next;
-    while(current!=NULL){
-        next=current->next;
-        free(current);
-        current=next;
-    }
-}
-
-void sig_child(int sig){
-    waitpid(-1,NULL,WNOHANG);
-}
-
-void sig_stop(int sig){
-    if(lastPid!=-1){
-        kill(lastPid,SIGSTOP);
-        pidLastStop=lastPid;
-        lastPid=-1;
+// Signal handler for SIGSTOP
+void sig_stop(int sig) {
+    // Pause the last running background process
+    if (lastPid != -1) {
+        // Send SIGSTOP to the last running background process
+        kill(lastPid, SIGSTOP);
+        // Update the pidLastStop to keep track of the stopped process
+        pidLastStop = lastPid;
+        lastPid = -1; // Reset lastPid to indicate no running background process
     }
 }
